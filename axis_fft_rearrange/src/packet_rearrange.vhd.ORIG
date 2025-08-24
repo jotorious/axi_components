@@ -1,0 +1,213 @@
+-- ***************************************************************************
+-- 01/26/2106
+-- Joe McKinney
+-- BIT Systems
+
+-- ***************************************************************************
+
+-- Library *******************************************************************
+
+library ieee;
+use     ieee.std_logic_1164.all;
+use     ieee.numeric_std.all;
+
+-- Entity Declaration ********************************************************
+
+entity packet_rearrange is
+	generic(
+		PKTLEN : integer := 256
+		);
+	port(
+        clk	: in std_logic;
+		rst	: in std_logic;
+		din	: in  std_logic_vector(31 downto 0);
+		din_en : in std_logic;
+        din_last : in std_logic;
+		dout	: out std_logic_vector(31 downto 0);
+		dout_en : out std_logic;
+        dout_pkt_idx : out std_logic_vector(15 downto 0);
+        dout_last : out std_logic;
+        bins : in std_logic_vector(15 downto 0)
+		);
+end packet_rearrange;
+
+architecture behav of packet_rearrange is
+
+function clog2 (bit_depth : integer) return integer is                  
+	 	variable depth  : integer := bit_depth;                               
+	 	variable count  : integer := 0;                                       
+	 begin                                                                   
+	 	 for clogb2 in 1 to bit_depth loop  -- Works for up to 32 bit integers
+	      if (bit_depth <= 2) then                                           
+	        count := 1;                                                      
+	      else                                                               
+	        if(depth <= 1) then                                              
+	 	       count := count;                                                
+	 	     else                                                             
+	 	       depth := depth / 2;                                            
+	          count := count + 1;                                            
+	 	     end if;                                                          
+	 	   end if;                                                            
+	   end loop;                                                             
+	   return(count);        	                                              
+	 end;
+
+component packet_ram is
+    generic (
+        MDEPTH : integer
+    );
+    port(
+      clk   : in  std_logic;
+      ena   : in  std_logic;
+      enb   : in  std_logic;
+      wea   : in  std_logic;
+      wr_addr : in  std_logic_vector(15 downto 0);
+      rd_addr : in  std_logic_vector(15 downto 0);
+      din   : in  std_logic_vector(31 downto 0);
+      dout   : out std_logic_vector(31 downto 0)
+    );
+end component;
+
+
+-----------------------------------
+-- rename slv32
+-----------------------------------  
+subtype slv32 is STD_LOGIC_VECTOR(31 DOWNTO 0);
+
+constant pkt1_ba : integer := 0;
+constant pkt1_ta : integer := PKTLEN-1;
+constant pkt2_ba : integer := PKTLEN;
+constant pkt2_ta : integer := 2*PKTLEN-1;
+
+constant pkt_addr_width : integer := clog2(PKTLEN);
+--Total Width is 16, pkt_addr_width say 6, then the pad is 16 - 6 - 1 = 9 for the pkt_sel
+signal pkt_addr_pad : std_logic_vector(15 - pkt_addr_width - 1 downto 0);
+
+signal waddr : std_logic_vector(15 downto 0);
+signal raddr : std_logic_vector(15 downto 0);
+
+--signal w_sind : std_logic_vector(11 downto 0);
+signal w_sind : std_logic_vector(pkt_addr_width - 1 downto 0);
+signal w_pkt_sel : std_logic;
+
+--signal r_sind : std_logic_vector(11 downto 0);
+signal r_sind : std_logic_vector(pkt_addr_width - 1  downto 0);
+signal r_pkt_sel : std_logic;
+
+
+
+signal bins_to_rotate : std_logic_vector(pkt_addr_width - 1 downto 0);
+constant bins_integer : integer := 13;
+
+signal wr_en : std_logic;
+signal r_addr_last : std_logic_vector(pkt_addr_width - 1 downto 0);
+signal read_ready : std_logic;
+
+signal bin_index , bin_index_dly: std_logic_vector( 15 downto 0);
+
+begin
+
+--bins_to_rotate <= std_logic_vector(to_unsigned(bins_integer,bins_to_rotate'length));
+
+-- Assume max FFT is 4096 --> 12 bits
+-- Then make ram 8192
+-- so addresss is 13 bits
+pkt_addr_pad <= (others =>'0');
+
+--waddr <= "000" & w_pkt_sel & w_sind;
+--raddr <= "000" & r_pkt_sel & r_sind;
+
+waddr <= pkt_addr_pad & w_pkt_sel & w_sind;
+raddr <= pkt_addr_pad & r_pkt_sel & r_sind;
+
+dout_pkt_idx <= bin_index_dly;
+
+my_ram_inst : packet_ram
+    generic map(
+        MDEPTH => PKTLEN*2
+    )
+    port map (
+        clk => clk,
+        ena => '1',
+        enb => '1',
+        wea  => '1',
+        wr_addr  => waddr,
+        rd_addr  => raddr,
+        din    => din,
+        dout    => dout
+    );
+
+
+
+main_proc: process(clk)
+	begin
+	if rising_edge(clk) then
+        if rst = '0' then
+            w_sind <= (others =>'0');
+            --r_sind <= bins_to_rotate;
+            bins_to_rotate  <= bins(pkt_addr_width - 1 downto 0);
+            r_sind          <= bins(pkt_addr_width - 1 downto 0);
+            w_pkt_sel <= '0';
+            r_pkt_sel <= '0';
+            r_addr_last <= std_logic_vector(unsigned(bins(pkt_addr_width - 1 downto 0)) - 1) ;
+            read_ready <= '0';
+            dout_en <= '0';
+            dout_last <= '0';
+            bin_index <= (others=> '0');
+            null;
+        else
+            bin_index_dly <= bin_index;
+            -------------------------
+            -- Input Data   - input driven
+            ------------------------
+            if din_en = '1' then
+                ------
+                -- WRITE RAM
+                -- pulse wea
+                wr_en <= '1';
+                -- incre waddr
+                if unsigned(w_sind) = PKTLEN -1 then
+                    w_sind <= (others=>'0');
+                    w_pkt_sel <= not w_pkt_sel ;
+                    read_ready <= '1';
+                else
+                    w_sind <= std_logic_vector(unsigned(w_sind) + 1 );
+                end if;
+
+                -----
+                -- READS are input driven
+                -----------
+                if read_ready = '1' then
+                    
+                    if unsigned(r_sind) = unsigned(r_addr_last) then -- This is end-of-packet
+                        r_pkt_sel <= not r_pkt_sel ;
+                        r_sind <= bins_to_rotate;
+                        dout_last <= '1';
+                        bin_index <= (others=> '0');
+                    elsif unsigned(r_sind) = PKTLEN -1 then   --- This is rollaround w/in a packet
+                        r_sind <= (others=>'0');
+                        bin_index <= std_logic_vector(unsigned(bin_index) + 1 );
+                        dout_last <= '0';
+                        
+                    else
+                        r_sind <= std_logic_vector(unsigned(r_sind) + 1 );
+                        bin_index <= std_logic_vector(unsigned(bin_index) + 1 );
+                        dout_last <= '0';
+                    end if;
+                    dout_en <= '1';
+                else
+                    dout_en <= '0';
+                end if;
+
+            else
+                wr_en <= '0';
+                dout_en <= '0';
+            end if;
+        end if;
+    end if;
+end process;
+
+
+  
+end architecture;
+

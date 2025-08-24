@@ -1,0 +1,314 @@
+----------------------------------------------------------------------------------
+-- Company: 
+-- Engineer: 
+-- 
+-- Create Date: 08/12/2018 12:02:15 PM
+-- Design Name: 
+-- Module Name: os_sbt_tb - Testbed
+-- Project Name: 
+-- Target Devices: 
+-- Tool Versions: 
+-- Description: 
+-- 
+-- Dependencies: 
+-- 
+-- Revision:
+-- Revision 0.01 - File Created
+-- Additional Comments:
+-- 
+----------------------------------------------------------------------------------
+
+
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use ieee.numeric_std.all;
+
+use ieee.std_logic_textio.all;  
+library std;
+use STD.textio.all;
+
+-- Uncomment the following library declaration if using
+-- arithmetic functions with Signed or Unsigned values
+--use IEEE.NUMERIC_STD.ALL;
+
+-- Uncomment the following library declaration if instantiating
+-- any Xilinx leaf cells in this code.
+--library UNISIM;
+--use UNISIM.VComponents.all;
+
+entity m_axis_source is
+    generic (
+        PKTLEN : integer;
+        infname : string
+    );
+    port (
+-- Global ports
+		M_AXIS_ACLK	: in std_logic;
+		-- 
+		M_AXIS_ARESETN	: in std_logic;
+		-- Master Stream Ports. TVALID indicates that the master is driving a valid transfer, A transfer takes place when both TVALID and TREADY are asserted. 
+		M_AXIS_TVALID	: out std_logic;
+		-- TDATA is the primary payload that is used to provide the data that is passing across the interface from the master.
+		M_AXIS_TDATA	: out std_logic_vector(31 downto 0);
+		-- TSTRB is the byte qualifier that indicates whether the content of the associated byte of TDATA is processed as a data byte or a position byte.
+		M_AXIS_TSTRB	: out std_logic_vector(3 downto 0);
+		-- TLAST indicates the boundary of a packet.
+		M_AXIS_TLAST	: out std_logic;
+		-- TREADY indicates that the slave can accept a transfer in the current cycle.
+		M_AXIS_TREADY	: in std_logic;
+
+        samples_read    : out integer
+    );
+end m_axis_source;
+
+architecture Testbed of m_axis_source is
+
+-----------------------------------------------------------------------
+  -- Timing constants
+  -----------------------------------------------------------------------
+  constant CLOCK_PERIOD : time := 2.5 ns;
+
+  type axi_stream32 is record
+    tdata : std_logic_vector(31 downto 0);
+    tuser : std_logic_vector(15 downto 0);
+    tvalid : std_logic;
+    tready : std_logic;
+    tlast  : std_logic;
+    tstrb  : std_logic_vector(3 downto 0);
+  end record axi_stream32;
+
+  signal master : axi_stream32;
+
+  -- FIFO Signals
+  constant FIFO_DEPTH : integer := 8;
+  --type RAM32 is array (0 to (FIFO_DEPTH-1)) of std_logic_vector((31)downto 0);
+  --signal fifo : RAM32;
+
+  type RAM_AXISD is array (0 to (FIFO_DEPTH-1)) of axi_stream32;
+  signal fifo : RAM_AXISD;
+  
+  constant axi_stream32_init : axi_stream32 := (    tdata => (others=> '0'),
+                                                    tuser => (others=> '0'),
+                                                    tvalid => '0',
+                                                    tready => '0',
+                                                    tlast => '0',
+                                                    tstrb => (others => '0'));
+
+
+  signal read_pointer : integer range 0 to FIFO_DEPTH-1; 
+  signal write_pointer : integer range 0 to FIFO_DEPTH-1;
+  signal depth, prev_depth : natural range 0 to FIFO_DEPTH ;
+
+  signal fifo_full, prev_fifo_full : std_logic;
+  signal fifo_empty, prev_fifo_empty : std_logic;
+  signal fifo_rden : std_logic;
+  signal fifo_wren : std_logic;
+  
+  signal skid, caught_skid : std_logic;
+
+  signal din : std_logic_vector(31 downto 0);
+  signal din_en : std_logic := '0';
+  signal din_last : std_logic := '0';
+  signal din_en_dly :std_logic := '0';
+
+  constant CPS : integer := 4;
+
+  ------------------------------------
+  -- Stuff for getting external data
+  ------------------------------------
+
+  file infile : text open read_mode is infname;
+  file outfile : text open write_mode is "Needle_INFILE.txt";  
+  signal tb_xn_re, tb_xn_im		: std_logic_vector (15 downto 0);
+  --signal tb_xk_re, tb_xk_im     : std_logic_vector (15 downto 0);
+
+  --signal samples_read : integer;
+
+
+  --constant PKTLEN : integer := 8;
+
+begin
+
+    -- Asynch Fifo Status signals
+	depth <= write_pointer - read_pointer when write_pointer >= read_pointer else
+             write_pointer - read_pointer + FIFO_DEPTH when write_pointer < read_pointer else
+             0;
+             
+    fifo_empty <= '1' when( (depth = 0) and ( (prev_depth = 1) or (prev_fifo_empty = '1') or (M_AXIS_ARESETN = '0') ) ) else '0';
+    fifo_full  <= '1' when( (depth = 0) and ( (prev_depth = FIFO_DEPTH-1) or ( prev_fifo_full = '1') ) ) else '0';   
+    
+	-- Data is valid when the fifo isn't empty  
+	master.tvalid <= '1' when (fifo_empty = '0') else '0';
+    
+    -- FIFO Write enable
+    -- The fifo is written when the fifo is not full and when the enable pulses high
+    fifo_wren <= '1' when ((fifo_full = '0') and (din_en = '1'))  else '0';
+    
+	--FIFO read enable generation
+    fifo_rden <= M_AXIS_TREADY and master.tvalid;
+
+    -- because fifo_wren is a combinatoric of the upstream registers den and fifo full
+    -- and den is synchronously enabled by fifo_full 
+    -- when running at single clock / sample, in the case that the fifo goes full
+    -- a sample is clocked out, but not written into the fifo
+    -- to fix this, catch this situation, and on the next fifo_wren,
+    -- don't clock out a sample
+    skid <= din_en and not fifo_wren;
+
+    -- Map signals to ports
+    M_AXIS_TVALID <= master.tvalid;
+    M_AXIS_TDATA  <= master.tdata;
+    M_AXIS_TLAST  <= master.tlast;
+    
+    -- Noty having the data registered seems to implement First Word Fall Through. It looks bad in simulation though
+    -- because the when the Fifo depth is zero, the read pointer points to bad/old data
+    --master.tdata <= fifo(read_pointer);
+    master.tdata <= fifo(read_pointer).tdata;
+    master.tlast <= fifo(read_pointer).tlast;
+
+
+
+
+
+------------------------
+--Data in process
+------------------------
+
+td_proc: process(M_AXIS_ACLK) 
+variable count : integer range 0 to CPS;
+variable s_count : integer range 0 to PKTLEN;
+variable file_count : integer;
+
+variable inline: line;
+variable vvalid: boolean;
+variable indata: std_logic_vector(15 downto 0);
+
+begin
+
+if rising_edge(M_AXIS_ACLK) then
+    if M_AXIS_ARESETN = '0' then
+        count := 0;
+        s_count := 0;
+        file_count := 0;
+        --din <= (others=>'0');
+        tb_xn_re <= (others=>'0');
+        tb_xn_im <= (others=>'0');
+        din_en <= '0';
+        din_en_dly <= '0';
+        caught_skid <= '0';
+    else
+        din_en_dly <= din_en;
+        if skid = '1' then
+            caught_skid <= '1';
+        end if;
+        count := count + 1;
+        if (count = CPS) then
+            count := 0;
+        end if;
+        -- Every X clks, if the Fifo isn't full, put new data up, and pulse the enable
+        if ((count = 0) and (fifo_full = '0')) then
+            if caught_skid = '1' then   -- If a skid was caught, hold it for a single write cycle
+                din_en <= '1';                
+                din_last <= din_last;
+                --din <= din;
+                tb_xn_re <= tb_xn_re;
+                tb_xn_im <= tb_xn_im;
+
+                caught_skid <= '0';
+            else
+                ----------------------
+                -- Read Data from File
+                ----------------------
+
+                --din <= std_logic_vector(unsigned(din) + 1);
+                if (not endfile(infile)) and (file_count < 262144)  then
+                    readline(infile,inline);
+                    hread(inline,indata);
+                    tb_xn_re <= indata;
+                    readline(infile,inline);
+                    hread(inline,indata);
+                    tb_xn_im <= indata;
+                    din_en <= '1';
+                    s_count := s_count + 1;
+                    file_count := file_count + 1;
+                    if (s_count = PKTLEN) then
+                        din_last <= '1';
+                        s_count := 0;
+                    else
+                        din_last <= '0';
+                    end if;
+                else
+                    report "input file done";
+                    din_en <= '0';
+                    din_last <= '0';
+                end if;
+                
+            end if;
+        else
+            din_en <= '0';
+        end if;
+        samples_read <= file_count;
+    end if;
+end if;
+end process;
+
+din(15 downto 0) <= tb_xn_re;
+din(31 downto 16) <= tb_xn_im;
+
+
+-------------------------------------------------
+-- This TB code is intended to isolate the M_AXIS signals 
+-- from the upstream dataflow. 
+------------------------------------------------------
+
+
+--- FIFO LOGIC
+fifo_process: process(M_AXIS_ACLK)                                                   
+	begin                                                                            
+	  if (rising_edge (M_AXIS_ACLK)) then                                            
+	    if(M_AXIS_ARESETN = '0') then                                                
+	      read_pointer <= 0;
+	      write_pointer <= 0;
+	      prev_fifo_empty <= '1';
+          prev_fifo_full <= '0';
+          prev_depth <= 0;
+          --fifo <= (others=>(others =>'0'));
+          fifo<= (others=> axi_stream32_init);
+          
+          --master.tdata <= (others=>'0');
+                                                                                                                
+	    else
+	      prev_depth <= depth;
+          prev_fifo_empty <= fifo_empty;
+          prev_fifo_full <= fifo_full;
+	      --------------------
+	      -- FIFO READ TO DOWNSTREAM, M_AXIS
+	      --------------------                                                                        
+	      if (fifo_rden = '1') then                         
+	          --master.tdata <= fifo(read_pointer);                        
+	          -- read pointer is incremented after every read from the FIFO                                         
+	          if read_pointer = FIFO_DEPTH - 1 then
+                  read_pointer <= 0;
+              else 
+                  read_pointer <= read_pointer + 1;
+              end if;                                                      
+          end if;
+	      --------------------
+          -- FIFO WRITE FROM UPSTREAM, Custom logic
+          --------------------
+	      
+	      if (fifo_wren = '1') then               
+              fifo(write_pointer).tdata <= din;
+              fifo(write_pointer).tlast <= din_last;
+              if write_pointer = FIFO_DEPTH - 1 then
+                write_pointer <= 0;
+              else 
+                write_pointer <= write_pointer + 1;
+              end if; 
+          end if;
+	                                                                         
+	    end  if;                                                                     
+	  end  if;                                                                       
+	end process; 
+
+end Testbed;

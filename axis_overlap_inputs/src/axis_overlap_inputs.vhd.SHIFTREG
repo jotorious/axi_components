@@ -1,0 +1,172 @@
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+use work.axis_wrapper_pkg.all;
+entity axis_overlap_inputs is
+	generic (
+        P : integer range 8 to 1024:= 1024;   -- P is overlap length (also filter length)
+        N : integer range 16 to 4096:= 4096;  -- N is FFT Length-- User parameters ends
+
+		C_M_AXIS_TDATA_WIDTH	: integer	:= 32;
+        C_M_AXIS_TUSER_WIDTH	: integer	:= 16;
+		C_S_AXIS_TDATA_WIDTH	: integer	:= 32
+	);
+	port (
+		-- Ports of Axi Master Bus Interface M00_AXIS
+		m_axis_aclk	: in std_logic;
+		m_axis_aresetn	: in std_logic;
+		m_axis_tvalid	: out std_logic;
+		m_axis_tready	: in std_logic;
+        m_axis_tdata	: out std_logic_vector(C_M_AXIS_TDATA_WIDTH-1 downto 0);
+		m_axis_tstrb	: out std_logic_vector((C_M_AXIS_TDATA_WIDTH/8)-1 downto 0);
+		m_axis_tuser	: out std_logic_vector(C_M_AXIS_TUSER_WIDTH-1 downto 0);
+		m_axis_tlast	: out std_logic;
+		
+
+		-- Ports of Axi Slave Bus Interface S00_AXIS
+		s_axis_aclk	: in std_logic;
+		s_axis_aresetn	: in std_logic;
+		s_axis_tvalid	: in std_logic;
+        s_axis_tready	: out std_logic;
+		s_axis_tdata	: in std_logic_vector(C_S_AXIS_TDATA_WIDTH-1 downto 0);
+		s_axis_tstrb	: in std_logic_vector((C_S_AXIS_TDATA_WIDTH/8)-1 downto 0);
+		s_axis_tuser	: in std_logic_vector(C_M_AXIS_TUSER_WIDTH-1 downto 0);
+		s_axis_tlast	: in std_logic
+		
+	);
+end axis_overlap_inputs;
+
+architecture arch_imp of axis_overlap_inputs is
+
+component overlap_input_version2 is
+    generic(
+		P : integer range 8 to 1024:= 1024;   -- P is overlap length (also filter length)
+		N : integer range 16 to 4096:= 4096  -- N is FFT Length
+		);
+	port(
+		
+        clk	: in std_logic;
+		rst	: in std_logic;
+        
+        din	: in  std_logic_vector(31 downto 0);
+        din_vld : in std_logic;
+        din_rdy : out std_logic;
+        din_idx : in std_logic_vector(15 downto 0);
+		
+        dout	: out std_logic_vector(31 downto 0);
+        dout_vld : out std_logic;
+        dout_rdy : in std_logic;
+        dout_idx : out std_logic_vector(15 downto 0);
+        dout_last : out std_logic
+		);
+end component;
+
+signal s_din : std_logic_vector(31 downto 0);
+signal s_din_en: std_logic;
+signal s_din_last: std_logic;
+signal s_din_rdy: std_logic;
+signal s_din_idx : std_logic_vector(15 downto 0);
+    
+signal s_dout: std_logic_vector(31 downto 0);
+signal s_dout_en :std_logic;
+signal s_dout_last: std_logic;
+signal s_dout_user: std_logic_vector(15 downto 0);
+
+signal d_fifo_full, u_fifo_empty, u_fifo_al_empty, u_fifo_rden : std_logic;
+
+signal ds_not_af : std_logic;
+signal d_fifo_almost_full : std_logic;
+
+begin
+
+
+-- Instantiation of Axi Bus Interface S00_AXIS
+axis_wrapper_saxis_inst : axis_wrapper_saxis
+	generic map (
+		C_S_AXIS_TDATA_WIDTH	=> C_S_AXIS_TDATA_WIDTH,
+        C_S_AXIS_TUSER_WIDTH	=> 16,
+        FIFO_MAX_DEPTH => 8,
+        FIFO_PROG_EMPTY => 3
+	)
+	port map (
+	    dout => s_din,
+        dout_last => s_din_last,
+        dout_user => s_din_idx,
+        fifo_rden =>u_fifo_rden,
+        fifo_empty => u_fifo_empty,
+        fifo_almost_empty => u_fifo_al_empty,
+	
+		S_AXIS_ACLK	=> s_axis_aclk,
+		S_AXIS_ARESETN	=> s_axis_aresetn,
+		S_AXIS_TREADY	=> s_axis_tready,
+		S_AXIS_TDATA	=> s_axis_tdata,
+		S_AXIS_TUSER	=> s_axis_tuser,
+        S_AXIS_TSTRB	=> s_axis_tstrb,
+		S_AXIS_TLAST	=> s_axis_tlast,
+		S_AXIS_TVALID	=> s_axis_tvalid
+	);
+
+
+	-- Add user logic here
+
+overlap_input_inst: overlap_input_version2
+        generic map(
+            P => P,
+            N => N)
+        port map(
+            
+            clk    => s_axis_aclk,
+            rst    => s_axis_aresetn,
+
+            din => s_din,
+            din_vld => s_din_en,
+            din_rdy => s_din_rdy,
+            din_idx => s_din_idx,
+
+            dout     => s_dout,
+            dout_vld => s_dout_en,
+            dout_rdy => ds_not_af,
+
+            dout_idx => s_dout_user,
+            dout_last => s_dout_last
+            );
+
+	-- User logic ends
+    
+    -- Instantiation of Axi Bus Interface M00_AXIS
+    axis_wrapper_maxis_inst : axis_wrapper_maxis
+        generic map (
+            C_M_AXIS_TDATA_WIDTH    => C_M_AXIS_TDATA_WIDTH,
+            C_M_AXIS_TUSER_WIDTH    => 16,
+            FIFO_MAX_DEPTH => 8,
+            FIFO_PROG_FULL => 5
+        )
+        port map (
+            din => s_dout,
+            din_en =>s_dout_en,
+            din_last => s_dout_last,
+            din_user => s_dout_user,
+            fifo_full => d_fifo_full,
+            fifo_almost_full => d_fifo_almost_full,
+                
+            M_AXIS_ACLK    => s_axis_aclk,
+            M_AXIS_ARESETN    => s_axis_aresetn,
+            M_AXIS_TVALID    => m_axis_tvalid,
+            M_AXIS_TDATA    => m_axis_tdata,
+            M_AXIS_TUSER    => m_axis_tuser,
+            M_AXIS_TSTRB    => m_axis_tstrb,
+            M_AXIS_TLAST    => m_axis_tlast,
+            M_AXIS_TREADY    => m_axis_tready
+        );
+
+    --u_fifo_rden <= not d_fifo_full;
+    ds_not_af <= not d_fifo_almost_full;
+    u_fifo_rden <= ds_not_af and s_din_rdy;
+
+    -- overlap_inputs generates it's own READY, and more importantly,
+    -- doesn't accept data when it's own READY is low.
+    s_din_en <= not u_fifo_empty;
+
+
+end arch_imp;

@@ -1,0 +1,229 @@
+-- ***************************************************************************
+-- 01/26/2106
+-- Joe McKinney
+-- BIT Systems
+-- This VHDL code is supposed to create overlapped input frames for
+-- a serially input N-Point FFT.
+-- This design is part of the design for a bank of subband tuners
+-- that performs Tune-Filter-Decimate, based on the paper
+-- "Turning Overlap-Save into a Multiband Mixing, Downsampling Filter Bank"
+--
+-- The overlap save functionality outputs N-sample frames with the first
+-- P-1 Samples copied from the end if the previous frame
+-- Thus this block takes in N-(P-1) samples and outputs N samples
+-- This imposes a constraint that the clock runs at least at the output rate
+-- This block designed to receive data from the read interface of a Fifo with the appropriate clk
+-- This block does not do any clock crossing
+--
+-- The major functionality of the block is a Modulo-N counter (+1)
+-- that 1) on the first P-1 clocks writes to the output the samples from the previous frame,
+-- 2) on the next N - 2(P-2)(?) clocks writes to the output the new incoming samples
+-- and 3) on the last P-1 clocks writes to the output the new incoming sample and stores
+-- these samples into a FIFO for retrival by at the next frame   
+-- ***************************************************************************
+
+-- Library *******************************************************************
+
+library ieee;
+use     ieee.std_logic_1164.all;
+use     ieee.numeric_std.all;
+
+-- Entity Declaration ********************************************************
+
+entity overlap_input_version2 is
+	generic(
+		P : integer range 8 to 1024:= 1024;   -- P is overlap length (also filter length)
+		N : integer range 16 to 4096:= 4096  -- N is FFT Length
+		);
+	port(
+		
+        clk	: in std_logic;
+		rst	: in std_logic;
+        
+        din	: in  std_logic_vector(31 downto 0);
+        din_vld : in std_logic;
+        din_rdy : out std_logic;
+        din_idx : in std_logic_vector(15 downto 0);
+		
+        dout	: out std_logic_vector(31 downto 0);
+        dout_vld : out std_logic;
+        dout_rdy : in std_logic;
+        dout_idx : out std_logic_vector(15 downto 0);
+        dout_last : out std_logic
+		);
+end overlap_input_version2;
+
+architecture beh of overlap_input_version2 is
+-----------------------------------
+-- Shift Register Signals
+-----------------------------------
+type ram_type is array (0 to P-1) of std_logic_vector(31 downto 0);
+signal ram : ram_type := (others=>(others=>'0'));
+
+constant fl : integer := 1;
+
+--signal fifo_not_empty, ds_fifo_not_full : std_logic;
+signal stuffing, not_stuffing : std_logic;
+signal tmp_idx : std_logic_vector(15 downto 0);
+
+signal testme : std_logic_vector(3 downto 0);
+signal testme2 : integer := 0;
+
+begin
+
+--fifo_not_empty <= not fifo_empty;
+--fifo_not_empty <= din_vld;
+--ds_fifo_not_full <= not ds_fifo_full;
+--ds_fifo_not_full <= dout_rdy;
+
+not_stuffing <= not stuffing;
+
+dout_idx <= tmp_idx;
+dout_last <= '1' when to_integer(unsigned(tmp_idx)) = N-1 else '0' ;
+
+
+
+--fifo_rden <= '1' when fifo_not_empty = '1' and ds_fifo_not_full = '1' and not_stuffing = '1' else '0';
+--din_rdy <= '1' when fifo_not_empty = '1' and ds_fifo_not_full = '1' and not_stuffing = '1' else '0';
+din_rdy <= '1' when din_vld = '1' and dout_rdy = '1' and not_stuffing = '1' else '0';
+
+-- rden must be asynch to be able to only read a single sample. Consider this a modified
+-- version of a fifo rden'ing itself with it's own (not) empty bit. (not) empty goes high at clk0, is
+-- fed right back, and is ready at clk1. at clk1 data is clocked out and (not) empty falls.
+-- if a flop-flop is added, then it's possible that another sample has been written/read and the status bits
+-- don't reflect the actual depth. The scenario for most concern here is that when the read_en
+-- takes an extra sample, then we have to wait for it's effects to be seen on the status before
+-- we use the status again. There is always an outstanding action or inaction inside the control loop
+-- Thinking about it, I was thinking the best way to deal with this would be to synchronously write
+-- single clk read_en pulses. So to get there I would edge detect on rden or even fifo_empty, but 
+-- with edges I can't do consecutive, wich effectively drops the throughput to clk/2
+
+-- I also tried using multiple fifo status bits, empty and almost empty. This is probably workable
+-- but complex. your fifo now can be empty (depth = 0), not empty but almost empty (depth = 1),
+-- and not empty and not almost empty (depth = 2). But in decoding this logic you also have to deal with
+-- a potential pending read that isn't reflected in the fifo status. The short version being that on every clock,
+-- one can no longer just look at is the fifo empty to determine whether to issue a read.  
+
+-- the way it works below, the status counter is effectively controlled by a single sort of "blocked" signal
+-- which is the same controller of the fifo_rden signal.
+
+
+main_proc: process(clk)
+    variable n_count : integer range 0 to N +1;
+	begin
+    if rising_edge(clk) then
+        if rst = '0' then
+            n_count := 0;
+            ram <= (others=>(others=>'1'));
+            --ram(0 to P-1) <= (0 => x"00000100", 1 => x"00000101", 2 => x"00000102", 3 => x"00000103",4 => x"00000104",5 => x"00000105",6 => x"00000106",7 => x"00000107");
+            dout_vld <= '0';
+        else
+            tmp_idx <= std_logic_vector(to_unsigned(n_count,tmp_idx'length));
+            if n_count < P - fl then     -- 0 to 5
+                -- Write (the stored) previous P-1 inputs out
+		        stuffing <= '1';
+                if dout_rdy = '1' then
+                    dout <= ram(P-1);
+                    dout_vld <= '1';
+                    ram(1 to P-1) <= ram(0 to P-2);
+                    ram(0) <= (others => '0');
+                    n_count := n_count + 1;
+                    testme <= "0001";
+                else
+                    dout_vld <= '0'; 
+                    testme <= "0010";           
+                end if;
+            -----------------
+            -- I need data in din when the last ram value is on dout
+            -- it appears 2 take 2 clocks, so add a state identical to above, but with
+            -- fifo_rden raised 
+            elsif ((n_count >= P-fl) and ( n_count < P)) then   -- 6 to 7
+                -- Write (the stored) previous P-1 inputs out
+                stuffing <= '0';
+		        if dout_rdy = '1' then
+                    dout <= ram(P-1);
+                    dout_vld <= '1';
+                    ram(1 to P-1) <= ram(0 to P-2);
+                    ram(0) <= (others => '0');
+                    n_count := n_count + 1;
+                    testme <= "0011";
+                    testme2 <= testme2 + 1;
+                else
+                    dout_vld <= '0';
+                    testme <= "0100";            
+                end if;   
+            elsif ((n_count >= P) and ( n_count < N-P)) then   --8 to 23
+		        testme2 <= 15;
+                stuffing <= '0';
+                -- Write new inputs out
+                if ((din_vld = '1')) then
+                    if dout_rdy = '1' then
+                        dout <= din;
+                        dout_vld <= '1';
+                        n_count := n_count + 1;
+                        testme <= "0101";
+                    else
+                        dout_vld <= '0';
+                    end if;
+                else
+                    dout_vld <= '0';
+                    testme <= "0110";            
+                end if;
+            elsif ((n_count >= N-P) and(n_count < N-fl)) then -- 24 to 29
+                if ((din_vld = '1')) then
+                    if dout_rdy = '1' then
+                        -- Write new inputs out
+                        -- and into fifo
+                        dout <= din;
+                        dout_vld <= '1';
+                        ram(0) <= din;
+                        ram(1 to P-1) <= ram(0 to P-2);
+                        n_count := n_count + 1;
+                        testme <= "0111";
+                    else
+                        dout_vld <= '0';
+                        testme <= "1000";            
+                    end if;
+                else
+                    dout_vld <= '0';
+                    testme <= "1001";
+                end if;
+            -- And then this is the state the same as above but with rden lowered
+            elsif (n_count >= N-fl) then               -- 30 to 31
+                if ((din_vld = '1')) then
+                    stuffing <= '1';
+	                if dout_rdy = '1' then
+                        -- Write new inputs out
+                        -- and into fifo
+                        dout <= din;
+                        dout_vld <= '1';
+                        ram(0) <= din;
+                        ram(1 to P-1) <= ram(0 to P-2);
+                        n_count := n_count + 1;
+                        testme <= "1010";
+                        if n_count = N then
+                            n_count := 0;
+                        end if;
+                    else
+                        dout_vld <= '0';
+                        testme <= "1011";            
+                    end if;
+                else
+                    dout_vld <= '0';
+                    testme <= "1100";
+                end if;
+            else
+                dout_vld <= '0';
+                testme <= "1101";
+            end if;  
+        end if;
+        
+        
+        
+		
+		
+	end if;
+end process;
+  
+end architecture;
+

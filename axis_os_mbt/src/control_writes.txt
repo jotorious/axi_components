@@ -1,0 +1,21 @@
+--OI
+write N,P,N-P
+
+--FFT
+write N? NOT DONE YET
+
+--FFT_Rearrange
+write PKTLEN (N), BINS
+
+--Ram Multiply
+write entire ram
+Write PKTLEN THIS ISN'T DONE? I don't think this is necessary as the read addresses are generated from tuser in, and the output tuser and tlast are copied from the datastream through the multiplier core
+
+--Stack Add
+write N, N/D, log2(N/(N/D))
+
+--IFFT
+write N/D? NOT DONE YET
+
+-- DS
+write N/D, P/D

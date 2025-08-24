@@ -1,0 +1,649 @@
+-- ***************************************************************************
+-- 01/26/2106
+-- Joe McKinney
+-- BIT Systems
+
+-- ***************************************************************************
+
+-- Library *******************************************************************
+
+library ieee;
+use     ieee.std_logic_1164.all;
+use     ieee.numeric_std.all;
+
+-- Entity Declaration ********************************************************
+
+entity stack_add is
+	generic(
+		PKTLENIN : integer := 256;
+        PKTLENOUT : integer := 32
+		);
+	port(
+        clk	: in std_logic;
+		rst	: in std_logic;
+		din	: in  std_logic_vector(31 downto 0);
+		din_en : in std_logic;
+        din_rdy : out std_logic;
+        din_last : in std_logic;
+		dout	: out std_logic_vector(31 downto 0);
+		dout_en : out std_logic;
+        dout_last : out std_logic;
+        dout_rdy : in std_logic
+    );
+end stack_add;
+
+architecture behav of stack_add is
+
+function clog2 (bit_depth : integer) return integer is                  
+	 	variable depth  : integer := bit_depth;                               
+	 	variable count  : integer := 0;                                       
+	 begin                                                                   
+	 	 for clogb2 in 1 to bit_depth loop  -- Works for up to 32 bit integers
+	      if (bit_depth <= 2) then                                           
+	        count := 1;                                                      
+	      else                                                               
+	        if(depth <= 1) then                                              
+	 	       count := count;                                                
+	 	     else                                                             
+	 	       depth := depth / 2;                                            
+	          count := count + 1;                                            
+	 	     end if;                                                          
+	 	   end if;                                                            
+	   end loop;                                                             
+	   return(count);        	                                              
+	 end;
+
+function bit_to_uint( bit_input : std_logic ) return integer is
+    variable slv : std_logic_vector(0 downto 0);
+    begin
+        slv(0) := bit_input;
+        return to_integer(unsigned(slv));
+    end;
+
+component packet_ram is
+    generic (
+        MDEPTH : integer
+    );
+    port(
+      clk   : in  std_logic;
+      ena   : in  std_logic;
+      enb   : in  std_logic;
+      wea   : in  std_logic;
+      wr_addr : in  std_logic_vector(15 downto 0);
+      rd_addr : in  std_logic_vector(15 downto 0);
+      din   : in  std_logic_vector(31 downto 0);
+      dout   : out std_logic_vector(31 downto 0)
+    );
+end component;
+
+
+
+-----------------------------------
+-- Types and subtypes
+-----------------------------------  
+--subtype slv32 is STD_LOGIC_VECTOR(31 DOWNTO 0);
+
+type slv32_array is array (0 to 1) of std_logic_vector(31 downto 0);
+
+type complex_slv16 is record
+    i : std_logic_vector(15 downto 0);
+    q : std_logic_vector(15 downto 0);
+end record complex_slv16;
+
+type complex_slv32 is record
+    i : std_logic_vector(31 downto 0);
+    q : std_logic_vector(31 downto 0);
+end record complex_slv32;
+
+type type_cmplx_din_dly is array (3 downto 0) of complex_slv16;
+
+constant cslv16_init : complex_slv16 := (i => (others=> '0'),
+                                              q => (others=> '0'));
+----------------------------
+-- constants
+----------------------------
+constant pktin_addr_width : integer := clog2(PKTLENIN);
+constant pktout_addr_width : integer := clog2(PKTLENOUT);
+constant pkt_ratio : integer := pktin_addr_width - pktout_addr_width;
+
+constant pkt_addr_pad : std_logic_vector(15 - pktout_addr_width downto 0) := (others =>'0');
+
+
+-- Wires to RAMS
+type slv16_array is array (0 to 1) of std_logic_vector(15 downto 0);
+signal waddr, raddr, waddr_short, raddr_short : slv16_array;
+
+signal ram_ren: std_logic_vector(0 to 1);
+signal ram_wen: std_logic_vector(0 to 1);
+
+type slv32_array2 is array (0 to 1) of std_logic_vector(31 downto 0);
+signal ram_din_q, ram_din_i : slv32_array2;
+signal ram_dout_q, ram_dout_i : slv32_array2;
+
+
+-- Process address registers/drivers
+signal ip_ram_addr : std_logic_vector(15 downto 0);
+signal op_ram_addr : std_logic_vector(15 downto 0);
+
+-- Address Pipelines
+type addr_dly_line is array (3 downto 0) of std_logic_vector(15 downto 0);
+signal ip_ram_addr_dly : addr_dly_line;
+signal op_ram_addr_dly : addr_dly_line;
+
+-- Input Data pipeline
+signal din_dly : type_cmplx_din_dly;
+signal din_en_dly : std_logic_vector (3 downto 0);
+
+-- Output Data Enable pipeline
+signal dout_en_dly : std_logic_vector(3 downto 0);
+signal dout_last_internal : std_logic;
+
+signal dout_tuser_internal, dout_tuser_internal_dly : std_logic_vector(15 downto 0) := (others=> '0');
+
+signal blah, blah_dly : std_logic;
+
+-- Ram State 
+type type_ram_state is (INPUTTING, IP_LAST_DIN, IP_LAST_REN_DRV, IP_LAST_RDATA_VLD, IP_LAST_WEN_DRV,
+                        OUTPUTTING, OUT_LAST_DATA, OUT_LAST_REN_DRV, OUT_LAST_RDATA_VLD, OUT_LAST_WEN_DRV);
+type state_array is array (0 to 1)of type_ram_state;
+signal ram_state : state_array; 
+
+
+signal ram_state_dly0 : state_array; 
+signal ram_state_dly1 : state_array;
+signal ram_state_dly2 : state_array; 
+ 
+
+-- RAM Selectors in Std Logic
+signal ip_ram_sl, ip_ram_tc_sl, not_ip_ram_tc_sl, op_ram_sl : std_logic;
+
+-- RAM Selector pipeline
+signal ip_ram_sl_dly, op_ram_sl_dly : std_logic_vector(3 downto 0);
+
+-- RAM Selector integers for switching (via array indexes)
+signal ip_ram_selector : integer range 0 to 1;
+signal op_ram_selector : integer range 0 to 1;
+
+type sel_dly_line is array(3 downto 0) of integer range 0 to 1;
+signal ip_ram_selector_dly : sel_dly_line;
+signal op_ram_selector_dly : sel_dly_line;
+
+signal testsignal0 : integer := 0;
+signal testsignal1 : integer := 0;
+signal testsignal2 : integer := 0;
+signal last_ip, last_op : std_logic_vector( 3 downto 0);
+
+-- ram bus signals
+signal ip_ren, ip_wen, op_ren,op_wen : std_logic;
+signal ip_raddr, ip_waddr, op_raddr, op_waddr : std_logic_vector( 15 downto 0);
+signal ip_ram_din_q, ip_ram_din_i, op_ram_din_q, op_ram_din_i : std_logic_vector(31 downto 0);
+signal ip_ram_dout_q, ip_ram_dout_i, op_ram_dout_q, op_ram_dout_i : std_logic_vector(31 downto 0);
+
+signal bad_logic : std_logic;
+
+signal ram0_ip_ren_ctrl : std_logic;
+signal ram0_ip_wen_ctrl : std_logic;
+signal ram0_ip_dvalid_ctrl : std_logic;
+
+
+signal ram0_op_ren_ctrl : std_logic;
+signal ram0_op_wen_ctrl : std_logic;
+
+signal ram1_ip_ren_ctrl : std_logic;
+signal ram1_ip_wen_ctrl : std_logic;
+signal ram1_ip_dvalid_ctrl : std_logic;
+
+signal ram1_op_ren_ctrl : std_logic;
+signal ram1_op_wen_ctrl : std_logic;
+
+
+
+
+
+begin
+
+-- SL to Integer conversions
+ip_ram_selector <= bit_to_uint(ip_ram_sl);
+op_ram_selector <= bit_to_uint(op_ram_sl);
+
+ip_sel_gen: for i in 0 to 3 generate
+    ip_ram_selector_dly(i) <= bit_to_uint(ip_ram_sl_dly(i));
+    op_ram_selector_dly(i) <= bit_to_uint(op_ram_sl_dly(i));
+end generate;
+
+din_rdy <=  '1' when (ram_state(0) = INPUTTING or ram_state(1) = INPUTTING ) else '0';
+
+bad_logic <= ip_ram_sl_dly(1) and op_ram_sl_dly(0);
+
+
+--I RAM 0
+packet_out_ram_inst0 : packet_ram
+    generic map(
+        MDEPTH => PKTLENOUT
+    )
+    port map (
+        clk => clk,
+        ena => ram_wen(0),
+        enb => ram_ren(0),
+        wea  => '1',
+        wr_addr  => waddr_short(0),
+        rd_addr  => raddr_short(0),
+        din    => ram_din_i(0),
+        dout    => ram_dout_i(0)
+    );
+
+--I RAM 1
+packet_out_ram_inst1 : packet_ram
+    generic map(
+        MDEPTH => PKTLENOUT
+    )
+    port map (
+        clk => clk,
+        ena => ram_wen(1),
+        enb => ram_ren(1),
+        wea  => '1',
+        wr_addr  => waddr_short(1),
+        rd_addr  => raddr_short(1),
+        din    => ram_din_i(1),
+        dout    => ram_dout_i(1)
+    );
+
+--Q RAM 0
+packet_out_ram_inst2 : packet_ram
+    generic map(
+        MDEPTH => PKTLENOUT
+    )
+    port map (
+        clk => clk,
+        ena => ram_wen(0),
+        enb => ram_ren(0),
+        wea  => '1',
+        wr_addr  => waddr_short(0),
+        rd_addr  => raddr_short(0),
+        din    => ram_din_q(0),
+        dout    => ram_dout_q(0)
+    );
+
+--Q RAM 1
+packet_out_ram_inst3 : packet_ram
+    generic map(
+        MDEPTH => PKTLENOUT
+    )
+    port map (
+        clk => clk,
+        ena => ram_wen(1),
+        enb => ram_ren(1),
+        wea  => '1',
+        wr_addr  => waddr_short(1),
+        rd_addr  => raddr_short(1),
+        din    => ram_din_q(1),
+        dout    => ram_dout_q(1)
+    );
+
+
+ram0_ip_ren_ctrl <= '1' when (ram_state(0) = INPUTTING) or (ram_state(0) = IP_LAST_DIN) or (ram_state(0) = IP_LAST_REN_DRV) else '0';
+
+ram0_ip_dvalid_ctrl <= '1' when (ram_state(0) = INPUTTING)    or (ram_state(0) = IP_LAST_DIN) or
+                             (ram_state(0) = IP_LAST_REN_DRV) or (ram_state(0) = IP_LAST_RDATA_VLD ) else '0';
+
+ram0_ip_wen_ctrl <= '1' when (ram_state(0) = INPUTTING)       or (ram_state(0) = IP_LAST_DIN) or
+                             (ram_state(0) = IP_LAST_REN_DRV) or (ram_state(0) = IP_LAST_RDATA_VLD ) or
+                             (ram_state(0) = IP_LAST_WEN_DRV) else '0';
+
+
+
+ram1_ip_ren_ctrl <= '1' when (ram_state(1) = INPUTTING) or (ram_state(1) = IP_LAST_DIN) or (ram_state(1) = IP_LAST_REN_DRV) else '0';
+
+ram1_ip_dvalid_ctrl <= '1' when (ram_state(1) = INPUTTING)    or (ram_state(1) = IP_LAST_DIN) or
+                             (ram_state(1) = IP_LAST_REN_DRV) or (ram_state(1) = IP_LAST_RDATA_VLD ) else '0';
+
+ram1_ip_wen_ctrl <= '1' when (ram_state(1) = INPUTTING)       or (ram_state(1) = IP_LAST_DIN) or
+                             (ram_state(1) = IP_LAST_REN_DRV) or (ram_state(1) = IP_LAST_RDATA_VLD ) or
+                             (ram_state(1) = IP_LAST_WEN_DRV) else '0';
+
+
+ram0_op_ren_ctrl <= '1' when (ram_state(0) = OUTPUTTING)    or (ram_state(0) = OUT_LAST_DATA)
+                          or (ram_state(0) = OUT_LAST_REN_DRV) else '0';
+
+ram1_op_ren_ctrl <= '1' when (ram_state(1) = OUTPUTTING)    or (ram_state(1) = OUT_LAST_DATA)
+                          or (ram_state(1) = OUT_LAST_REN_DRV) else '0';
+
+
+ram0_op_wen_ctrl <= '1' when (ram_state(0) = OUTPUTTING) or (ram_state(0) = OUT_LAST_DATA) or
+                             (ram_state(0) = OUT_LAST_REN_DRV) or (ram_state(0) = OUT_LAST_RDATA_VLD) or
+                             (ram_state(0) = OUT_LAST_WEN_DRV) else '0';
+
+ram1_op_wen_ctrl <= '1' when (ram_state(1) = OUTPUTTING) or (ram_state(1) = OUT_LAST_DATA) or
+                             (ram_state(1) = OUT_LAST_REN_DRV) or (ram_state(1) = OUT_LAST_RDATA_VLD) or
+                             (ram_state(1) = OUT_LAST_WEN_DRV) else '0';
+
+
+-- RAM 0 Input switches
+ram_ren(0) <= ip_ren when (ram0_ip_ren_ctrl = '1') and (ip_ram_selector_dly(1) = 0) else 
+              op_ren when (ram0_op_ren_ctrl = '1') and (op_ram_selector_dly(1) = 0) else
+              '0';
+
+raddr(0) <= ip_raddr when (ram0_ip_ren_ctrl = '1') and (ip_ram_selector_dly(1) = 0) else 
+            op_raddr when (ram0_op_ren_ctrl = '1') and (op_ram_selector_dly(1) = 0) else
+            (others=>'0');
+
+
+ram_wen(0) <= ip_wen when (ram0_ip_wen_ctrl = '1') and (ip_ram_selector_dly(3) = 0)else
+              op_wen when (ram0_op_wen_ctrl = '1') and (op_ram_selector_dly(3) = 0) else
+              '0';
+
+waddr(0) <= ip_waddr when (ram0_ip_wen_ctrl = '1') and (ip_ram_selector_dly(3) = 0)else
+            op_waddr when (ram0_op_wen_ctrl = '1') and (op_ram_selector_dly(3) = 0) else
+            (others=>'0');
+
+ram_din_i(0) <= ip_ram_din_i when (ram0_ip_wen_ctrl = '1') and (ip_ram_selector_dly(3) = 0)else
+                op_ram_din_i when (ram0_op_wen_ctrl = '1') and (op_ram_selector_dly(3) = 0) else
+                (others=>'0');
+
+ram_din_q(0) <= ip_ram_din_q when ram0_ip_wen_ctrl = '1' and (ip_ram_selector_dly(3) = 0)else
+                op_ram_din_q when ram0_op_wen_ctrl = '1' and (op_ram_selector_dly(3) = 0) else
+                (others=>'0');
+
+
+
+-- RAM1 Input switches
+ram_ren(1) <= ip_ren when (ram1_ip_ren_ctrl = '1') and (ip_ram_selector_dly(1) = 1) else 
+              op_ren when ram1_op_ren_ctrl = '1' and (op_ram_selector_dly(1) = 1) else
+              '0';
+
+raddr(1) <= ip_raddr when (ram1_ip_ren_ctrl = '1') and (ip_ram_selector_dly(1) = 1) else 
+            op_raddr when (ram1_op_ren_ctrl = '1') and (op_ram_selector_dly(1) = 1) else
+            (others=>'0');
+
+
+ram_wen(1) <= ip_wen when (ram1_ip_wen_ctrl = '1' ) and (ip_ram_selector_dly(3) = 1) else
+              op_wen when (ram1_op_wen_ctrl = '1') and (op_ram_selector_dly(3) = 1) else
+              '0';
+
+waddr(1) <= ip_waddr when (ram1_ip_wen_ctrl = '1') and (ip_ram_selector_dly(3) = 1) else
+            op_waddr when (ram1_op_wen_ctrl = '1') and (op_ram_selector_dly(3) = 1) else
+            (others=>'0');
+
+ram_din_i(1) <= ip_ram_din_i when (ram1_ip_wen_ctrl = '1') and (ip_ram_selector_dly(3) = 1) else
+                op_ram_din_i when (ram1_op_wen_ctrl = '1') and (op_ram_selector_dly(3) = 1) else
+                (others=>'0');
+
+ram_din_q(1) <= ip_ram_din_q when (ram1_ip_wen_ctrl = '1') and (ip_ram_selector_dly(3) = 1) else
+                op_ram_din_q when (ram1_op_wen_ctrl = '1') and (op_ram_selector_dly(3) = 1) else
+                (others=>'0');
+
+raddr_short(0) <= pkt_addr_pad & raddr(0)(pktout_addr_width - 1 downto 0);
+raddr_short(1) <= pkt_addr_pad & raddr(1)(pktout_addr_width - 1 downto 0);
+waddr_short(0) <= pkt_addr_pad & waddr(0)(pktout_addr_width - 1 downto 0);
+waddr_short(1) <= pkt_addr_pad & waddr(1)(pktout_addr_width - 1 downto 0);
+
+
+-- RAM output switches
+
+
+
+ip_ram_dout_i<= ram_dout_i(0) when ram0_ip_dvalid_ctrl = '1' and ip_ram_selector_dly(2) = 0 else
+                ram_dout_i(1) when ram1_ip_dvalid_ctrl = '1' and ip_ram_selector_dly(2) = 1 else
+                (others=>'0');
+
+ip_ram_dout_q<= ram_dout_q(0) when ram0_ip_dvalid_ctrl = '1' and ip_ram_selector_dly(2) = 0 else
+                ram_dout_q(1) when ram1_ip_dvalid_ctrl = '1' and ip_ram_selector_dly(2) = 1 else
+                (others=>'0');
+
+op_ram_dout_i<= ram_dout_i(0) when op_ram_selector_dly(2) = 0 else
+                ram_dout_i(1) when op_ram_selector_dly(2) = 1 else
+                (others=>'0');
+
+op_ram_dout_q<= ram_dout_q(0) when op_ram_selector_dly(2) = 0 else
+                ram_dout_q(1) when op_ram_selector_dly(2) = 1 else
+                (others=>'0');
+
+
+
+
+main_proc: process(clk)
+	begin
+	if rising_edge(clk) then
+        if rst = '0' then
+            ram_state(0) <= INPUTTING;
+            ram_state(1) <= INPUTTING;
+            ip_ram_sl <= '0';
+            op_ram_sl <= '0';
+            ip_ram_addr <= ( others=>'0');
+            op_ram_addr <= ( others=>'0');
+            --ram_ren <= (others=>'0');
+            --ram_wen <= (others=>'0');
+
+            din_dly         <= (others=>cslv16_init);
+            din_en_dly      <= (others=>'0');
+            ip_ram_addr_dly <= (others=>(others=>'0'));
+            ip_ram_sl_dly   <= (others=>'0');
+            last_ip         <= (others=>'0');
+            --ram_din_i <= (others=>(others=>'0'));
+            --ram_din_q <= (others=>(others=>'0'));
+            
+            op_ram_addr_dly <= (others=>(others=>'0'));
+            op_ram_sl_dly   <= (others=>'0');
+            dout_en_dly <= (others=>'0');
+            last_op <= (others=>'0');
+            dout <= ( others=>'0');
+        else
+            ram_state_dly0 <= ram_state;
+            ram_state_dly1 <= ram_state_dly0;
+            ram_state_dly2 <= ram_state_dly1;
+
+
+            -------------------------
+            -- Input Side
+            ------------------------
+            din_dly         (3 downto 1) <= din_dly(2 downto 0);
+            din_en_dly      (3 downto 1) <= din_en_dly(2 downto 0);
+            ip_ram_addr_dly (3 downto 1) <= ip_ram_addr_dly(2 downto 0);
+            ip_ram_sl_dly   (3 downto 1) <= ip_ram_sl_dly(2 downto 0);
+            last_ip         (3 downto 1) <= last_ip(2 downto 0);
+
+            ------------
+            -- Clock 0
+            ------------
+            -- On den and and ram not full, start the add process
+            if ( (din_en = '1') and (ram_state(ip_ram_selector) = INPUTTING)) then
+                
+                -- Clock data in, enable den_dly, capture address and ram_select
+                din_dly(0).i <= din(15 downto 0);
+                din_dly(0).q <= din(31 downto 16);
+                din_en_dly(0) <= '1';
+
+                -- These are the values for this input sample
+                ip_ram_addr_dly(0) <= ip_ram_addr;
+                ip_ram_sl_dly(0) <= ip_ram_sl;
+
+                --On Last sample, reset addr to 0, change the state to full, and change the write_selector
+                if unsigned(ip_ram_addr) = PKTLENIN -1 then
+                    ip_ram_addr <= (others=>'0');
+                    ram_state(ip_ram_selector) <= IP_LAST_DIN;
+                    ip_ram_sl <= not ip_ram_sl;
+                    last_ip(0) <= '1';
+                else
+                    ip_ram_addr <= std_logic_vector(unsigned(ip_ram_addr) + 1 );
+                    last_ip(0) <= '0';
+                end if;
+            else
+                din_en_dly(0) <= '0';
+            end if;
+
+            ------------
+            -- Clock 1
+            ------------  
+
+            -- Raise Drive RADDR, raise REN
+            if din_en_dly(0) = '1' then
+                if ram_state(ip_ram_selector_dly(0)) = IP_LAST_DIN then
+                    ram_state(ip_ram_selector_dly(0)) <= IP_LAST_REN_DRV;
+                end if;
+
+                ip_ren <= '1';
+                ip_raddr <= ip_ram_addr_dly(0);
+
+            else
+                ip_ren <= '0';
+
+            end if;
+            
+            ------------
+            -- Clock 2
+            ------------ 
+            -- RADDR,REN get clocked in
+
+            if din_en_dly(1) = '1' then
+                if ram_state(ip_ram_selector_dly(1)) = IP_LAST_REN_DRV then
+                    ram_state(ip_ram_selector_dly(1)) <= IP_LAST_RDATA_VLD;
+                end if;
+            end if;
+            
+            ------------
+            -- Clock 3
+            ------------  
+            
+            if din_en_dly(2) = '1' then
+                --Data valid on Ram out
+                -- Raise WEN
+                ip_wen <= '1';
+                ip_waddr <= ip_ram_addr_dly(2);
+                ip_ram_din_i <= std_logic_vector(resize(signed(din_dly(2).i),ip_ram_din_i'length) + signed(ip_ram_dout_i));
+                ip_ram_din_q <= std_logic_vector(resize(signed(din_dly(2).q),ip_ram_din_q'length) + signed(ip_ram_dout_q));
+
+                if ram_state(ip_ram_selector_dly(2)) = IP_LAST_RDATA_VLD then
+                    ram_state(ip_ram_selector_dly(2)) <= IP_LAST_WEN_DRV;
+                end if;
+            else
+                ip_wen <= '0';
+            end if;
+
+            ------------
+            -- Clock 4
+            ------------
+            if din_en_dly(3) = '1' then
+                if ram_state(ip_ram_selector_dly(3)) = IP_LAST_WEN_DRV then
+                    ram_state(ip_ram_selector_dly(3)) <= OUTPUTTING;
+                end if;
+            end if;
+
+            --------------------------
+            -- Output Side
+            --------------------------
+            op_ram_addr_dly (3 downto 1) <= op_ram_addr_dly(2 downto 0);
+            op_ram_sl_dly   (3 downto 1) <= op_ram_sl_dly(2 downto 0);
+            dout_en_dly     (3 downto 1) <= dout_en_dly(2 downto 0);
+            last_op         (3 downto 1) <= last_op(2 downto 0);
+
+            ------------
+            -- Clock 0
+            ------------
+
+            if (ram_state(op_ram_selector) = OUTPUTTING ) then
+
+                if (true and (dout_rdy = '1')) then
+                    dout_en_dly(0) <= '1';
+                    op_ram_addr_dly(0) <= op_ram_addr;
+                    op_ram_sl_dly(0) <= op_ram_sl;
+                    -- Increment read address
+                    if unsigned(op_ram_addr) = PKTLENOUT -1 then  -- Roll around
+                        -- Reset to 0
+                        op_ram_addr <= (others=>'0');
+                    
+                        -- Set write lock on current RAM
+                        ram_state(op_ram_selector) <= OUT_LAST_DATA;
+                        -- Switch o/p ram
+                        op_ram_sl <= not op_ram_sl;
+                        last_op(0) <= '1';
+                    else
+                        op_ram_addr <= std_logic_vector(unsigned(op_ram_addr) + 1 );
+                        dout_last <= '0';
+                        last_op(0) <= '0';
+                    end if;
+                else
+                    dout_en_dly(0) <= '0';
+                    last_op(0) <= '0';
+                    null; --waiting for Downstream
+                end if;
+            else
+                dout_en_dly(0) <= '0';
+                last_op(0) <= '0';
+                -- Waiting for a RAM to be ready
+            end if;
+
+            ------------
+            -- Clock 1
+            ------------
+
+            if dout_en_dly(0) = '1' then
+                -- Raise REN
+                op_ren <= '1';
+                op_raddr <= op_ram_addr_dly(0);
+                if ram_state(op_ram_selector_dly(0)) = OUT_LAST_DATA then
+                    ram_state(op_ram_selector_dly(0)) <= OUT_LAST_REN_DRV;
+                end if;
+            else
+                op_ren <= '0';
+
+            end if;
+    
+
+            ------------
+            -- Clock 2
+            ------------
+
+            if dout_en_dly(1) = '1' then
+                if ram_state(op_ram_selector_dly(1)) = OUT_LAST_REN_DRV then
+                    ram_state(op_ram_selector_dly(1)) <= OUT_LAST_RDATA_VLD;
+                end if;
+            end if;
+
+            ------------
+            -- Clock 3
+            ------------
+
+            if dout_en_dly(2) = '1' then
+                --Data valid on Ram out
+                dout_en <= '1';
+                dout_last <= last_op(2);                
+                dout(15 downto 0) <= op_ram_dout_i(15 + pkt_ratio downto 0 + pkt_ratio );
+                dout(31 downto 16)<= op_ram_dout_q(15 + pkt_ratio downto 0 + pkt_ratio );
+                
+                -- Raise WEN
+                op_wen <= '1';
+                op_waddr <= op_ram_addr_dly(2);
+                op_ram_din_i <= (others=>'0');
+                op_ram_din_q <= (others=>'0');
+                if ram_state(op_ram_selector_dly(2)) = OUT_LAST_RDATA_VLD then
+                    ram_state(op_ram_selector_dly(2)) <= OUT_LAST_WEN_DRV;
+                end if;
+            else
+                op_wen <= '0';
+                --ram_wen(op_ram_selector_dly(2)) <= '0';
+                testsignal2 <= 1;
+                dout_en <= '0';
+                dout_last <= '0';
+            end if;
+
+            ------------
+            -- Clock 4
+            ------------
+
+            if dout_en_dly(3) = '1' then
+                if ram_state(op_ram_selector_dly(3)) = OUT_LAST_WEN_DRV then
+                    ram_state(op_ram_selector_dly(3)) <= INPUTTING;
+                end if;
+            end if;
+
+
+
+        end if;
+    end if;
+end process;
+
+
+
+  
+end architecture;
+

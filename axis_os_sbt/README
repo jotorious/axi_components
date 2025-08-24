@@ -1,0 +1,1 @@
+This folder contains the top level for an os-subband tuner, as well as otehr source that isn't encapsulated in axis-wrappers. This design relies on axis_fft_rearrange, axi_overlap_inputs, axis_discard_samples, axis_stack_add, and probably some more. You'll figure it out.
