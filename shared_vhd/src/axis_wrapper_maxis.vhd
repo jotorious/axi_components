@@ -3,7 +3,7 @@ use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 
 -- I modified this from an open-source example on the internet, after having alot of trouble implementing
--- this functionality using a RAM based approach. Writing Software for 3 years has made me soft. Logic is King. 
+-- this functionality using a RAM based approach. 
 
 -- When using this wrapper, the programmable full generic is used to specify when when
 -- the almost full signal goes high. This is important.
